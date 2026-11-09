@@ -704,12 +704,73 @@ static int prog_bump(uint32_t n)
     return prog_redraw(s_prog_since_paint >= (64u * 1024u));
 }
 
+/* ---- first-launch cache timing (diagnostics only, no behaviour change) ----
+ * Splits the "Caching game" wait into: flash erase+program (everything inside
+ * store_data_begin/append/finish) vs the rest (SD read + inflate + convert).
+ * Summary goes to printf and is appended to /neogeo_cache.log on the SD. */
+#ifndef HOST_BUILD
+/* Redirected to the firmware ABI by gw_core_bridge_redefine_syms.txt. */
+extern uint32_t HAL_GetTick(void);
+#define TM_NOW() ((uint32_t)HAL_GetTick())
+#else
+#define TM_NOW() 0u
+#endif
+static uint32_t s_tm_t0, s_tm_flash_ms, s_tm_flash_bytes, s_tm_calls;
+static char s_tm_name[32];
+
+static void tm_reset(const char *name)
+{
+    snprintf(s_tm_name, sizeof(s_tm_name), "%s", name ? name : "?");
+    s_tm_flash_ms = 0;
+    s_tm_flash_bytes = 0;
+    s_tm_calls = 0;
+    s_tm_t0 = TM_NOW();
+}
+
+static void tm_report(void)
+{
+    uint32_t total = TM_NOW() - s_tm_t0;
+    uint32_t other = total > s_tm_flash_ms ? total - s_tm_flash_ms : 0;
+    uint32_t kb = s_tm_flash_bytes >> 10;
+    uint32_t kbs = s_tm_flash_ms ? (kb * 1000u) / s_tm_flash_ms : 0;
+    char line[160];
+
+    snprintf(line, sizeof(line),
+             "%s: total %u ms | flash %u ms (%u KiB, %u calls, %u KiB/s) | "
+             "SD+inflate+convert %u ms\n",
+             s_tm_name, (unsigned)total, (unsigned)s_tm_flash_ms,
+             (unsigned)kb, (unsigned)s_tm_calls, (unsigned)kbs,
+             (unsigned)other);
+    printf("neo_cache: %s", line);
+#ifndef HOST_BUILD
+    {
+        FILE *lf = fopen("/neogeo_cache.log", "ab");
+        if (lf) {
+            fwrite(line, 1, strlen(line), lf);
+            fclose(lf);
+        }
+    }
+#endif
+}
+
+static int tm_append(flash_stream_t *st, const uint8_t *buf, uint32_t len)
+{
+    uint32_t t = TM_NOW();
+    int r = store_data_append(st, buf, len) ? 1 : 0;
+
+    s_tm_flash_ms += TM_NOW() - t;
+    s_tm_flash_bytes += len;
+    s_tm_calls++;
+    return r;
+}
+
 static void prog_finish(void)
 {
     if (s_prog_total)
         s_prog_done = s_prog_total;
     s_prog_last_pct = 0xff;
     (void)prog_paint(100, 1);
+    tm_report();
 }
 
 static int key_hit(const char *stem, const char *suf, uint32_t expect,
@@ -805,7 +866,7 @@ static int page_flush(flash_stream_t *st)
 {
     if (!s_page_used)
         return 1;
-    if (!store_data_append(st, s_page, s_page_used))
+    if (!tm_append(st, s_page, s_page_used))
         return 0;
     s_page_used = 0;
     return 1;
@@ -824,14 +885,14 @@ static int append_bytes(flash_stream_t *st, const void *p, uint32_t n)
             src += take;
             n -= take;
             if (s_page_used == 256u) {
-                if (!store_data_append(st, s_page, 256u))
+                if (!tm_append(st, s_page, 256u))
                     return 0;
                 s_page_used = 0;
             }
         } else {
             uint32_t aligned = n & ~255u;
             if (aligned >= 256u) {
-                if (!store_data_append(st, src, aligned))
+                if (!tm_append(st, src, aligned))
                     return 0;
                 src += aligned;
                 n -= aligned;
@@ -849,8 +910,13 @@ static int append_bytes(flash_stream_t *st, const void *p, uint32_t n)
 
 static int stream_begin(flash_stream_t *st, const char *key, uint32_t total)
 {
+    uint32_t t = TM_NOW();
+    int r;
+
     page_reset();
-    return store_data_begin(st, key, total) ? 1 : 0;
+    r = store_data_begin(st, key, total) ? 1 : 0;
+    s_tm_flash_ms += TM_NOW() - t;
+    return r;
 }
 
 #ifndef HOST_BUILD
@@ -901,7 +967,13 @@ static const uint8_t *stream_finish(flash_stream_t *st)
         store_data_abort(st);
         return NULL;
     }
-    return store_data_finish(st);
+    {
+        uint32_t t = TM_NOW();
+        const uint8_t *r = store_data_finish(st);
+
+        s_tm_flash_ms += TM_NOW() - t;
+        return r;
+    }
 }
 
 static void stream_abort(flash_stream_t *st)
@@ -1434,6 +1506,9 @@ int neo_zip_flash_load(const char *zip_path)
                    "(usable=%u bios+ro reserved)\n",
                    (unsigned)weight, (unsigned)max_game,
                    (unsigned)flash_cache_usable_size());
+            printf("neo_zip: %s is %u bytes (%u%%) over the flash limit\n",
+                   stem, (unsigned)(weight - max_game),
+                   (unsigned)(((weight - max_game) >> 10) * 100u / (max_game >> 10)));
             zip_set_err("ROM too large for flash");
             neo_zip_close(z);
             neo_zip_set_scratch(NULL, 0);
@@ -1445,6 +1520,7 @@ int neo_zip_flash_load(const char *zip_path)
                (unsigned)s_prog_done, (unsigned)s_prog_total,
                (unsigned)s_prog_steps);
 #endif
+        tm_reset(stem);
         snprintf(s_prog_hdr, sizeof(s_prog_hdr), "Neo Geo");
         if (!prog_paint(prog_pct(), 1)) {
             neo_zip_close(z);
@@ -1903,12 +1979,16 @@ int neo_neo_flash_load(const char *neo_path)
             if (max_game && weight > max_game) {
                 printf("neo_neo: game needs %u bytes, max %u\n",
                        (unsigned)weight, (unsigned)max_game);
+                printf("neo_neo: %s is %u bytes (%u%%) over the flash limit\n",
+                       stem, (unsigned)(weight - max_game),
+                       (unsigned)(((weight - max_game) >> 10) * 100u / (max_game >> 10)));
                 zip_set_err("ROM too large for flash");
                 fclose(f);
                 return 0;
             }
         }
 #endif
+        tm_reset(stem);
         snprintf(s_prog_hdr, sizeof(s_prog_hdr), "Neo Geo");
         if (!prog_paint(prog_pct(), 1)) {
             fclose(f);
