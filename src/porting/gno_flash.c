@@ -148,6 +148,61 @@ static int read_u32_le(const uint8_t **pp, uint32_t *out)
     return GN_TRUE;
 }
 
+
+#ifndef HOST_BUILD
+/* Append one line to /neogeo_cache.log (cache-timing measurements). */
+static void neo_cache_log(const char *line)
+{
+    FILE *lf = fopen("/neogeo_cache.log", "ab");
+    if (lf) {
+        fwrite(line, 1, strlen(line), lf);
+        fclose(lf);
+    }
+}
+
+/* Raw SD read speed: read up to 4 MiB of the file into a scratch buffer.
+ * Run only on a cache hit so it measures SD alone (no flash erase/program). */
+static void neo_cache_sd_read_test(const char *path, const char *stem)
+{
+    extern uint32_t HAL_GetTick(void);
+    static const uint32_t sizes[] = { 32768, 16384, 8192, 4096 };
+    uint8_t *buf = NULL;
+    uint32_t chunk = 0, total = 0, t0, ms, i;
+    const uint32_t want = 4u << 20;
+    char line[160];
+    FILE *f;
+
+    for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]) && !buf; i++) {
+        buf = malloc(sizes[i]);
+        chunk = sizes[i];
+    }
+    if (!buf)
+        return;
+    f = fopen(path, "rb");
+    if (!f) {
+        free(buf);
+        return;
+    }
+    t0 = HAL_GetTick();
+    while (total < want) {
+        size_t rd = fread(buf, 1, chunk, f);
+        if (rd == 0)
+            break;
+        total += (uint32_t)rd;
+        wdog_refresh();
+    }
+    ms = HAL_GetTick() - t0;
+    fclose(f);
+    free(buf);
+    snprintf(line, sizeof(line), "sd  %s: read %lu KiB in %lu ms (%lu KiB/s, chunk %lu)\n",
+             stem, (unsigned long)(total >> 10), (unsigned long)ms,
+             (unsigned long)(ms ? ((uint64_t)(total >> 10) * 1000u) / ms : 0),
+             (unsigned long)chunk);
+    printf("neo_cache: %s", line);
+    neo_cache_log(line);
+}
+#endif
+
 static int bind_region(ROM_REGION *r, uint32_t size, const uint8_t **pp)
 {
     if ((uint32_t)(*pp + size - gno_base) > gno_size)
@@ -900,6 +955,14 @@ int gno_flash_load(const char *path)
                     printf("gno: %s needs %u, max %u (usable=%u)\n",
                            path, (unsigned)need, (unsigned)max_game,
                            (unsigned)usable);
+                    {
+                        char line[200];
+                        snprintf(line, sizeof(line),
+                                 "too large %s: needs %u, max %u (usable=%u, ro=%u)\n",
+                                 path, (unsigned)need, (unsigned)max_game,
+                                 (unsigned)usable, (unsigned)ro);
+                        neo_cache_log(line);
+                    }
                     gno_set_err("ROM too large for flash");
                     return GN_FALSE;
                 }
@@ -923,19 +986,19 @@ int gno_flash_load(const char *path)
             uint32_t kib = size >> 10;
             uint32_t kbps = ms ? (uint32_t)(((uint64_t)kib * 1000u) / ms) : 0;
             const char *stem = strrchr(path, '/');
-            FILE *lf;
             stem = stem ? stem + 1 : path;
             printf("neo_cache: %s: %lu ms for %lu KiB (%lu KiB/s)\n",
                    stem, (unsigned long)ms, (unsigned long)kib, (unsigned long)kbps);
-            lf = fopen("/neogeo_cache.log", "ab");
-            if (lf) {
+            {
                 char line[160];
                 snprintf(line, sizeof(line), "gno %s: %lu ms for %lu KiB (%lu KiB/s)\n",
                          stem, (unsigned long)ms, (unsigned long)kib,
                          (unsigned long)kbps);
-                fwrite(line, 1, strlen(line), lf);
-                fclose(lf);
+                neo_cache_log(line);
             }
+            /* Cache hit: also measure raw SD read speed for comparison. */
+            if (ms < 1000)
+                neo_cache_sd_read_test(path, stem);
         }
     }
 #else
