@@ -910,7 +910,37 @@ int gno_flash_load(const char *path)
     }
 #endif
 
+#ifndef HOST_BUILD
+    {
+        /* Time the firmware's SD -> flash copy (hit = fast lookup, cold =
+         * full SD read + erase + program). Shown on screen and appended to
+         * /neogeo_cache.log so first-launch cost can be measured on device. */
+        extern uint32_t HAL_GetTick(void);
+        uint32_t t0 = HAL_GetTick(), ms;
+        mapped = odroid_overlay_cache_file_in_flash(path, &size, false);
+        ms = HAL_GetTick() - t0;
+        if (mapped) {
+            uint32_t kib = size >> 10;
+            uint32_t kbps = ms ? (uint32_t)(((uint64_t)kib * 1000u) / ms) : 0;
+            const char *stem = strrchr(path, '/');
+            FILE *lf;
+            stem = stem ? stem + 1 : path;
+            printf("neo_cache: %s: %lu ms for %lu KiB (%lu KiB/s)\n",
+                   stem, (unsigned long)ms, (unsigned long)kib, (unsigned long)kbps);
+            lf = fopen("/neogeo_cache.log", "ab");
+            if (lf) {
+                char line[160];
+                snprintf(line, sizeof(line), "gno %s: %lu ms for %lu KiB (%lu KiB/s)\n",
+                         stem, (unsigned long)ms, (unsigned long)kib,
+                         (unsigned long)kbps);
+                fwrite(line, 1, strlen(line), lf);
+                fclose(lf);
+            }
+        }
+    }
+#else
     mapped = odroid_overlay_cache_file_in_flash(path, &size, false);
+#endif
     if (!mapped) {
         printf("gno: flash cache failed for %s\n", path);
         gno_set_err("ROM too large for flash");
